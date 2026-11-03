@@ -91,12 +91,13 @@
     return a;
   }
 
-  function sub(id, title, nodes) {
+  function sub(id, title, nodes, text) {
     const d = el('details', 'sub');
     if (id) d.id = id;
     const s = el('summary', null, title);
     s.append(el('span', 'count', String(nodes.length)));
     const body = el('div', 'sub-body');
+    if (text) body.append(...paragraphs(text, 'note sub-note'));
     body.append(...nodes);
     d.append(s, body);
     return d;
@@ -115,7 +116,7 @@
     if (groups.length) {
       groups.forEach(g => {
         const items = current.filter(d => d.group === g.id);
-        if (items.length) frag.append(sub(g.id, g.title, items.map(d => docNode(d, stateOf(d, now)))));
+        if (items.length || g.text) frag.append(sub(g.id, g.title, items.map(d => docNode(d, stateOf(d, now))), g.text));
       });
       const loose = current.filter(d => !groups.some(g => g.id === d.group));
       loose.forEach(d => frag.append(docNode(d, stateOf(d, now))));
@@ -130,6 +131,107 @@
     return { node: frag, count: current.length };
   }
 
+  /* ---------- Текст из панели ----------
+     Абзацы разделяются пустой строкой, внутри абзаца — перенос строки.
+     **жирный** и [текст](адрес) — единственная разметка; HTML не принимается. */
+  function inline(text) {
+    const frag = document.createDocumentFragment();
+    const re = /\*\*([^*]+)\*\*|\[([^\]]+)\]\(([^)\s]+)\)/g;
+    let last = 0, m;
+    const plain = s => s.split('\n').forEach((line, i) => {
+      if (i) frag.append(el('br'));
+      frag.append(document.createTextNode(line));
+    });
+    while ((m = re.exec(text))) {
+      plain(text.slice(last, m.index));
+      if (m[1]) frag.append(el('strong', null, m[1]));
+      else {
+        const href = safeHref(m[3]) || (/^(mailto:|tel:|#)/i.test(m[3]) ? m[3] : '');
+        const a = el(href ? 'a' : 'span', null, m[2]);
+        if (href) {
+          a.href = href;
+          if (/^https?:/i.test(href)) { a.target = '_blank'; a.rel = 'noopener'; }
+        }
+        frag.append(a);
+      }
+      last = re.lastIndex;
+    }
+    plain(text.slice(last));
+    return frag;
+  }
+
+  function paragraphs(text, cls) {
+    return String(text || '').split(/\n\s*\n/).map(s => s.trim()).filter(Boolean).map(p => {
+      const n = el('p', cls);
+      n.append(inline(p));
+      return n;
+    });
+  }
+
+  /* Информационные блоки раздела: текст, реквизиты, список статусов, примечание */
+  function renderBlocks(blocks) {
+    const frag = document.createDocumentFragment();
+    (blocks || []).forEach(b => {
+      if (b.type === 'text') frag.append(...paragraphs(b.text));
+      else if (b.type === 'note') frag.append(...paragraphs(b.text, 'note'));
+      else if (b.type === 'fields') {
+        const dl = el('dl', 'kv');
+        (b.rows || []).forEach(r => {
+          const dd = el('dd');
+          dd.append(inline(r.value || ''));
+          dl.append(el('dt', null, r.label || ''), dd);
+        });
+        if (dl.children.length) frag.append(dl);
+      } else if (b.type === 'statuses') {
+        const box = el('div', 'status');
+        (b.rows || []).forEach(r => {
+          const row = el('div');
+          const v = el('span');
+          v.append(inline(r.value || ''));
+          row.append(el('span', null, r.label || ''), v);
+          box.append(row);
+        });
+        if (box.children.length) frag.append(box);
+      }
+    });
+    return frag;
+  }
+
+  /* id раздела или подраздела из названия: латиница, для якорей в адресе */
+  const TR = 'а:a б:b в:v г:g д:d е:e ё:e ж:zh з:z и:i й:y к:k л:l м:m н:n о:o п:p р:r с:s т:t у:u ф:f х:h ц:ts ч:ch ш:sh щ:sch ъ: ы:y ь: э:e ю:yu я:ya'
+    .split(' ').reduce((o, p) => { const [k, v] = p.split(':'); o[k] = v; return o; }, {});
+  function slug(text, taken) {
+    let base = String(text || '').toLowerCase().split('').map(c => (c in TR ? TR[c] : c)).join('')
+      .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40).replace(/-+$/, '') || 'razdel';
+    let id = base, n = 2;
+    while (taken && taken.has(id)) id = base + '-' + n++;
+    return id;
+  }
+
+  /* Данные, сохранённые до появления редактора страницы (version 1: только
+     документы), дополняем текстами и разделами из исходного контента сборки. */
+  function migrate(content, defaults) {
+    if (!content || !Array.isArray(content.sections)) return defaults;
+    if (content.version >= 2 || !defaults) return content;
+    const clone = o => JSON.parse(JSON.stringify(o));
+    const saved = new Map(content.sections.map(s => [s.id, s]));
+    const sections = defaults.sections.map(def => {
+      const s = saved.get(def.id);
+      if (!s) return clone(def);
+      saved.delete(def.id);
+      return Object.assign(clone(def), s, { blocks: s.blocks || clone(def.blocks || []), toc: s.toc || def.toc || '' });
+    });
+    saved.forEach(s => sections.push(Object.assign({ toc: '', blocks: [], groups: [] }, s)));
+    const site = clone(defaults.site);
+    const f = content.facts || {};
+    const fact = (site.hero.facts || []).find(x => x.key === 'ownFunds');
+    if (fact && f.ownFunds) {
+      fact.value = f.ownFunds;
+      if (f.ownFundsDate) fact.note = 'по состоянию на ' + fmt(f.ownFundsDate);
+    }
+    return { version: 2, site, sections };
+  }
+
   /* «Основные документы» на главной: отмеченные в панели и действующие */
   function renderPinned(sections, now) {
     now = now || today();
@@ -140,5 +242,8 @@
     return frag;
   }
 
-  window.LinkorDocs = { STATUS, today, fmt, stateOf, meta, safeHref, extOf, renderSection, renderPinned };
+  window.LinkorDocs = {
+    STATUS, today, fmt, stateOf, meta, safeHref, extOf, el,
+    renderSection, renderPinned, renderBlocks, inline, paragraphs, slug, migrate
+  };
 })();
