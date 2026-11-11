@@ -82,14 +82,6 @@
     $('accountsCards').append(a);
   });
 
-  /* ---------- Основные документы ---------- */
-  const docsHead = site.documents || {};
-  fill('documentsTitle', docsHead.title);
-  fill('documentsIntro', docsHead.intro);
-  const pinned = document.querySelector('[data-pinned]');
-  pinned.replaceChildren(D.renderPinned(content.sections, now));
-  show('documents', docsHead.show !== false && pinned.children.length > 0);
-
   /* ---------- Раскрытие информации ---------- */
   const disc = site.disclosure || {};
   fill('disclosureTitle', disc.title);
@@ -97,7 +89,8 @@
 
   const box = $('sections');
   const toc = $('toc');
-  (content.sections || []).forEach(section => {
+  // скрытые в панели разделы не выводятся, но и не удаляются из данных
+  (content.sections || []).filter(s => !s.hidden).forEach(section => {
     const d = el('details', 'acc');
     d.id = section.id;
     d.dataset.title = section.toc || section.title;
@@ -110,7 +103,7 @@
     sum.append(plus);
     const body = el('div', 'acc-body');
     body.append(D.renderBlocks(section.blocks));
-    if ((section.docs || []).length || (section.groups || []).some(g => g.text)) {
+    if ((section.docs || []).length || (section.groups || []).some(g => g.text && !g.hidden)) {
       const docs = el('div', 'docs');
       docs.append(r.node);
       body.append(docs);

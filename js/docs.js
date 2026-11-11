@@ -20,6 +20,30 @@
     return `${m[3]}.${m[2]}.${m[1]}` + (m[4] ? ` в ${m[4]}` : '');
   }
 
+  /* Дата из текста — вставленного из письма, Word или другого документа панели:
+     «08.04.2026 12:00», «08.04.2026 в 12:00», «8.4.2026», «2026-04-08T12:00».
+     withTime=false отбрасывает время (для «Действует с / по»). null — не дата. */
+  function parseDate(text, withTime) {
+    const v = String(text || '').trim().replace(/\s+/g, ' ');
+    if (!v) return '';
+    let m = /^(\d{1,2})\.(\d{1,2})\.(\d{4})(?:,? (?:в )?(\d{1,2}):(\d{2}))?(?: ?г\.?)?$/i.exec(v);
+    let y, mo, d, h, mi;
+    if (m) [, d, mo, y, h, mi] = m;
+    else if ((m = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2}))?/.exec(v))) [, y, mo, d, h, mi] = m;
+    else return null;
+    const p = n => String(n).padStart(2, '0');
+    const dt = new Date(+y, +mo - 1, +d);
+    if (dt.getMonth() !== +mo - 1 || dt.getDate() !== +d) return null;
+    if (h != null && (+h > 23 || +mi > 59)) return null;
+    return `${y}-${p(mo)}-${p(d)}` + (withTime && h != null ? `T${p(h)}:${mi}` : '');
+  }
+
+  /* ISO → текст для поля ввода: «08.04.2026 12:00» */
+  function dateText(iso) {
+    const m = /^(\d{4})-(\d\d)-(\d\d)(?:T(\d\d:\d\d))?/.exec(iso || '');
+    return m ? `${m[3]}.${m[2]}.${m[1]}` + (m[4] ? ' ' + m[4] : '') : '';
+  }
+
   /* Статус с учётом дат: документ «вступает в силу» и «уходит в архив» сам,
      когда наступает дата, — без правки в панели. */
   function stateOf(doc, now) {
@@ -35,7 +59,10 @@
     if (doc.note) parts.push(doc.note);
     const disclosed = doc.disclosed ? 'дата раскрытия ' + fmt(doc.disclosed) : '';
     let period = '';
-    if (state === 'archive') {
+    if (state === 'archive' && doc.stillValid) {
+      // в архиве, но не утратил силу — например, РСС прошлых месяцев
+      period = doc.from ? `период актуальности — с ${fmt(doc.from)} по настоящее время` : 'период актуальности — по настоящее время';
+    } else if (state === 'archive') {
       if (doc.from && doc.to) period = `период актуальности — с ${fmt(doc.from)} по ${fmt(doc.to)}`;
       else if (doc.to) period = `период актуальности — по ${fmt(doc.to)}`;
     } else if (state === 'pending') {
@@ -108,17 +135,19 @@
   function renderSection(section, now) {
     now = now || today();
     const frag = document.createDocumentFragment();
-    const docs = section.docs || [];
+    // скрытый подраздел убирает с сайта и свои документы — и действующие, и архивные
+    const hiddenGroups = new Set((section.groups || []).filter(g => g.hidden).map(g => g.id));
+    const docs = (section.docs || []).filter(d => !hiddenGroups.has(d.group));
     const current = docs.filter(d => stateOf(d, now) !== 'archive');
     const archived = docs.filter(d => stateOf(d, now) === 'archive');
-    const groups = section.groups || [];
+    const groups = (section.groups || []).filter(g => !g.hidden);
 
     if (groups.length) {
       groups.forEach(g => {
         const items = current.filter(d => d.group === g.id);
         if (items.length || g.text) frag.append(sub(g.id, g.title, items.map(d => docNode(d, stateOf(d, now))), g.text));
       });
-      const loose = current.filter(d => !groups.some(g => g.id === d.group));
+      const loose = current.filter(d => !(section.groups || []).some(g => g.id === d.group));
       loose.forEach(d => frag.append(docNode(d, stateOf(d, now))));
     } else {
       current.forEach(d => frag.append(docNode(d, stateOf(d, now))));
@@ -208,11 +237,32 @@
     return id;
   }
 
-  /* Данные, сохранённые до появления редактора страницы (version 1: только
-     документы), дополняем текстами и разделами из исходного контента сборки. */
+  /* Перенос сохранённых данных на текущий формат (version 3):
+     v1 — только документы: дополняем текстами и разделами из исходного контента сборки;
+     v2 — был блок «Основные документы»: убираем его, пункт меню и отметки у документов. */
   function migrate(content, defaults) {
     if (!content || !Array.isArray(content.sections)) return defaults;
-    if (content.version >= 2 || !defaults) return content;
+    if (content.version >= 3) return content;
+    const v2 = content.version === 2 || !defaults ? content : fromV1(content, defaults);
+    const out = JSON.parse(JSON.stringify(v2));
+    if (out.site) {
+      delete out.site.documents;
+      out.site.nav = (out.site.nav || []).filter(n => n.href !== '#documents');
+    }
+    out.sections.forEach(s => (s.docs || []).forEach(d => { delete d.pin; }));
+    // разделы, где архив продолжает действовать (РСС): настройка и отметка у архивных без даты «по»
+    const defs = new Map(((defaults && defaults.sections) || []).map(s => [s.id, s]));
+    out.sections.forEach(s => {
+      const def = defs.get(s.id);
+      if (!def || !def.archiveStillValid || s.archiveStillValid !== undefined) return;
+      s.archiveStillValid = true;
+      (s.docs || []).forEach(d => { if (d.status === 'archive' && !d.to) d.stillValid = true; });
+    });
+    out.version = 3;
+    return out;
+  }
+
+  function fromV1(content, defaults) {
     const clone = o => JSON.parse(JSON.stringify(o));
     const saved = new Map(content.sections.map(s => [s.id, s]));
     const sections = defaults.sections.map(def => {
@@ -232,18 +282,8 @@
     return { version: 2, site, sections };
   }
 
-  /* «Основные документы» на главной: отмеченные в панели и действующие */
-  function renderPinned(sections, now) {
-    now = now || today();
-    const frag = document.createDocumentFragment();
-    (sections || []).forEach(s => (s.docs || []).forEach(d => {
-      if (d.pin && stateOf(d, now) === 'active') frag.append(docNode(d, 'active'));
-    }));
-    return frag;
-  }
-
   window.LinkorDocs = {
-    STATUS, today, fmt, stateOf, meta, safeHref, extOf, el,
-    renderSection, renderPinned, renderBlocks, inline, paragraphs, slug, migrate
+    STATUS, today, fmt, parseDate, dateText, stateOf, meta, safeHref, extOf, el,
+    renderSection, renderBlocks, inline, paragraphs, slug, migrate
   };
 })();
